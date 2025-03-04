@@ -8,7 +8,9 @@
 ```
 # WaterLog anomaly dataset
 
+The WaterLog anomaly dataset is a time series dataset collected from industrial control system, designed for anomaly detection tasks. It contains multiple features over time, capturing both normal and anomalous patterns. The dataset is structured in an [dataset_SAU.xlsx](dataset/dataset_SAU.xlsx) file, with 16 features and anomaly labels.
 
+This dataset is used in our study to evaluate the effectiveness of the ChaMTeC model for detecting anomalies in time series data.
 
 # Results
 
