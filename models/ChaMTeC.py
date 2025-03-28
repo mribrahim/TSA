@@ -1,30 +1,116 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.Embed import DataEmbedding_inverted
 import numpy as np
+import math
 
+class TemporalPositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, embedding_dim]
+        """
+        return x + self.pe[:x.size(1)]
+    
+class DataEmbedding_inverted(nn.Module):
+    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+        super(DataEmbedding_inverted, self).__init__()
+        self.value_embedding = nn.Linear(c_in, d_model)
+        self.temporal_pos_encoder = TemporalPositionalEncoding(d_model)
+        self.dropout = nn.Dropout(p=dropout)
 
+    def forward(self, x, x_mark):
+        x = x.permute(0, 2, 1)  # [Batch, Variate, Time] -> [Batch, Time, Variate]
+        
+        if x_mark is None:
+            x = self.value_embedding(x)  # [Batch, Time, Variate] -> [Batch, Time, d_model]
+        else:
+            x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1))
+        
+        # Add temporal positional encoding
+        x = self.temporal_pos_encoder(x)  # [Batch, Time, d_model]
+        
+        return self.dropout(x)
+    
+class TemporalAttention(nn.Module):
+    def __init__(self, d_model, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        assert self.head_dim * n_heads == d_model, "d_model must be divisible by n_heads"
+        
+        # Linear layers for Q, K, V projections
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(d_model, d_model)
+        self.proj_dropout = nn.Dropout(dropout)
+        self.scale = 1.0 / (self.head_dim ** 0.5)
+        
+    def forward(self, x):
+        # x shape: (B, F, D)
+        B, F, D = x.shape
+        
+        # Project to query, key, value - we operate on the temporal dimension (D)
+        q = self.query(x).view(B, F, self.n_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, F, head_dim)
+        k = self.key(x).view(B, F, self.n_heads, self.head_dim).permute(0, 2, 1, 3)    # (B, H, F, head_dim)
+        v = self.value(x).view(B, F, self.n_heads, self.head_dim).permute(0, 2, 1, 3)   # (B, H, F, head_dim)
+        
+        # Compute attention scores (across time for each feature)
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, F, F)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
+        
+        # Apply attention to values
+        x = (attn @ v).permute(0, 2, 1, 3).reshape(B, F, D)  # (B, F, D)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+        
+        return x
 
+    
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model, d_ff=None, dropout=0.1, activation="relu"):
+    def __init__(self, d_model, d_ff=None, dropout=0.1, activation="relu", n_heads=8):
         super(EncoderLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
+        
+        # Temporal attention (now properly handling BxFxD input)
+        self.temporal_attn = TemporalAttention(d_model, n_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        
+        # Conv FFN (modified to handle the dimensionality)
         self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
         self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
-        self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
     def forward(self, x):
-        y = x = self.norm1(x)
-        y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
-        y = self.dropout(self.conv2(y).transpose(-1, 1))
-
-        return self.norm2(x + y)
-    
+        # x shape: (B, F, D)
+        
+        # Temporal attention
+        x = x + self.temporal_attn(self.norm1(x))
+        
+        # Conv FFN
+        y = self.norm2(x)
+        y = self.dropout(self.activation(self.conv1(y.permute(0, 2, 1))))  # Conv1D expects (B, D, F)
+        y = self.dropout(self.conv2(y).permute(0, 2, 1))  # Back to (B, F, D)
+        
+        return x + y
 
 
 class Encoder(nn.Module):
@@ -111,45 +197,10 @@ class Model(nn.Module):
             self.dropout = nn.Dropout(configs.dropout)
             self.projection = nn.Linear(configs.d_model * configs.enc_in, configs.num_class)
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # Normalization from Non-stationary Transformer
-        means = x_enc.mean(1, keepdim=True).detach()
-        x_enc = x_enc - means
-        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc /= stdev
 
-        _, _, N = x_enc.shape
 
-        # Embedding
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        enc_out = self.encoder(enc_out)
 
-        dec_out = self.projection(enc_out).permute(0, 2, 1)[:, :, :N]
-        # De-Normalization from Non-stationary Transformer
-        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
-        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
-        return dec_out
-
-    def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
-        # Normalization from Non-stationary Transformer
-        means = x_enc.mean(1, keepdim=True).detach()
-        x_enc = x_enc - means
-        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc /= stdev
-
-        _, L, N = x_enc.shape
-
-        # Embedding
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        enc_out = self.encoder(enc_out)
-
-        dec_out = self.projection(enc_out).permute(0, 2, 1)[:, :, :N]
-        # De-Normalization from Non-stationary Transformer
-        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, L, 1))
-        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, L, 1))
-        return dec_out
-
-    def anomaly_detection(self, x_enc):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         # Normalization from Non-stationary Transformer
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc - means
@@ -178,30 +229,3 @@ class Model(nn.Module):
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, L, 1))
 
         return dec_out
-
-    def classification(self, x_enc, x_mark_enc):
-        # Embedding
-        enc_out = self.enc_embedding(x_enc, None)
-        enc_out = self.encoder(enc_out)
-
-        # Output
-        output = self.act(enc_out)  # the output transformer encoder/decoder embeddings don't include non-linearity
-        output = self.dropout(output)
-        output = output.reshape(output.shape[0], -1)  # (batch_size, c_in * d_model)
-        output = self.projection(output)  # (batch_size, num_classes)
-        return output
-
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]  # [B, L, D]
-        if self.task_name == 'imputation':
-            dec_out = self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
-            return dec_out  # [B, L, D]
-        if self.task_name == 'anomaly_detection':
-            dec_out = self.anomaly_detection(x_enc)
-            return dec_out  # [B, L, D]
-        if self.task_name == 'classification':
-            dec_out = self.classification(x_enc, x_mark_enc)
-            return dec_out  # [B, N]
-        return None
