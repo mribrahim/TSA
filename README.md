@@ -1,10 +1,16 @@
 # Cite paper
 
-[ChaMTeC: CHAnnel Mixing and TEmporal Convolution Network for Time Series Anomaly Detection](..)
+[ChaMTeC: CHAnnel Mixing and TEmporal Convolution Network for Time Series Anomaly Detection](https://www.mdpi.com/2076-3417/15/10/5623)
 
 
 ```
-
+@article{delibasoglu2025chamtec,
+  title={ChaMTeC: CHAnnel Mixing and TEmporal Convolution Network for Time-Series Anomaly Detection},
+  author={Delibasoglu, Ibrahim and Balta, Deniz and Balta, Musa},
+  journal={Applied Sciences},
+  year={2025},
+  publisher={Multidisciplinary Digital Publishing Institute}
+}
 ```
 # WaterLog anomaly dataset
 

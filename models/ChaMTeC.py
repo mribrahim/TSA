@@ -4,6 +4,11 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+
+# ChaMTeC: CHAnnel Mixing and TEmporal Convolution Network for Time-Series Anomaly Detection
+# https://www.mdpi.com/2076-3417/15/10/5623
+
+
 class TemporalPositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
